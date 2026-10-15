@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>QuickTranslate Overlay</title>
+    <style>
+      :root {
+        --bg: rgba(15, 23, 42, 0.82);
+        --text: #f8fafc;
+        --border: rgba(148, 163, 184, 0.6);
+        --close-bg: rgba(15, 23, 42, 0.7);
+      }
+
+      * { box-sizing: border-box; }
+
+      html, body {
+        margin: 0;
+        width: 100vw;
+        height: 100vh;
+        overflow: hidden;
+        background: transparent;
+        font-family: "Segoe UI", sans-serif;
+        -webkit-app-region: no-drag;
+        app-region: no-drag;
+      }
+
+      body {
+        position: relative;
+        pointer-events: auto;
+        user-select: none;
+      }
+
+      #overlay {
+        position: absolute;
+        left: 0;
+        top: 0;
+        display: none;
+        max-width: 220px;
+        min-width: 0;
+        padding: 2px 18px 2px 6px;
+        border: 1px solid var(--border);
+        border-radius: 3px;
+        background: var(--bg);
+        color: var(--text);
+        opacity: 0;
+        overflow: visible;
+        z-index: 2147483647;
+        pointer-events: auto;
+        -webkit-app-region: no-drag;
+        app-region: no-drag;
+      }
+
+      #overlay.visible {
+        opacity: 1;
+      }
+
+      #overlay-text {
+        display: inline-block;
+        max-width: 200px;
+        font-size: 12px;
+        line-height: 1.2;
+        font-weight: 600;
+        color: var(--text);
+        white-space: normal;
+        word-break: break-word;
+        overflow-wrap: anywhere;
+      }
+
+      #overlay-text.loading {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+      }
+
+      .loading-dots {
+        display: inline-flex;
+        align-items: center;
+        gap: 3px;
+        height: 12px;
+      }
+
+      .loading-dot {
+        width: 3px;
+        height: 3px;
+        border-radius: 50%;
+        background: currentColor;
+        animation: loading-bounce 700ms ease-in-out infinite;
+      }
+
+      .loading-dot:nth-child(2) { animation-delay: 120ms; }
+      .loading-dot:nth-child(3) { animation-delay: 240ms; }
+
+      @keyframes loading-bounce {
+        0%, 60%, 100% { transform: translateY(0); }
+        30% { transform: translateY(-4px); }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .loading-dot { animation: none; }
+      }
+
+    </style>
+  </head>
+  <body>
+    <div id="overlay">
+      <div id="overlay-text"></div>
+    </div>
+
+    <script type="module">
+      const overlay = document.getElementById('overlay');
+      const textEl = document.getElementById('overlay-text');
+
+      const showOverlay = (text) => {
+        if (!overlay || !textEl) return;
+        textEl.textContent = String(text ?? '').replace(/^[\s\uFEFF]+/, '');
+        overlay.style.left = '0px';
+        overlay.style.top = '0px';
+        overlay.style.display = 'inline-block';
+        overlay.classList.add('visible');
+        window.__quicktranslateOpen = true;
+      };
+
+      const hideOverlay = () => {
+        if (!overlay) return;
+        overlay.classList.remove('visible');
+        overlay.style.display = 'none';
+        window.__quicktranslateOpen = false;
+      };
+
+      document.addEventListener('mousedown', (event) => {
+        if (event.button === 0) {
+          hideOverlay();
+        }
+      });
+
+      window.quicktranslateShow = showOverlay;
+      window.quicktranslateHide = hideOverlay;
+    </script>
+  </body>
+</html>
