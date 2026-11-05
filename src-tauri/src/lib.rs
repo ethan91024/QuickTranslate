@@ -18,7 +18,7 @@ use tauri::{
 use tauri::webview::Color;
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
-const APP_VERSION: &str = "0.1.4";
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const HOTKEY_COOLDOWN_MS: u64 = 1500;
 
@@ -415,12 +415,10 @@ mod overlay_tests {
     use super::overlay_window_size;
 
     #[test]
-    fn translated_text_window_grows_for_wrapped_lines() {
-        let (_, one_line_height) = overlay_window_size("agent", false);
-        let (_, multiple_lines_height) = overlay_window_size(
-            "這是一段很長的翻譯文字，需要換行顯示，不應該被固定高度裁掉",
-            false,
-        );
+    fn translated_text_window_grows_for_numbered_alternatives() {
+        let (_, one_line_height) = overlay_window_size("1.變動(v.)", false);
+        let (_, multiple_lines_height) =
+            overlay_window_size("1.變動(v.)\n2.工作輪流(n.)\n3.改變(v.)", false);
 
         assert!(multiple_lines_height > one_line_height);
     }
@@ -569,7 +567,7 @@ fn handle_translation_shortcut(app: tauri::AppHandle) {
     };
 
     let app_for_overlay = app.clone();
-    let text_for_overlay = format!("{} → {}", translation.original, translation.translated);
+    let text_for_overlay = translation.translated;
     let _ = app.run_on_main_thread(move || {
         let _ = show_translation_overlay(app_for_overlay, text_for_overlay);
     });
