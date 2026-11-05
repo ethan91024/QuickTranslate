@@ -4,6 +4,7 @@ mod screen;
 mod translation;
 
 use std::process::Command;
+use std::os::windows::process::CommandExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -18,6 +19,7 @@ use tauri::webview::Color;
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
 const APP_VERSION: &str = "0.1.4";
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 const HOTKEY_COOLDOWN_MS: u64 = 1500;
 
 static HOTKEY_DEBOUNCE: AtomicBool = AtomicBool::new(false);
@@ -247,19 +249,39 @@ fn quick_capture() -> Result<serde_json::Value, String> {
         region_height,
     )
     .to_image();
-    let ocr_result = ocr::recognize(&region)?;
-    let selected_text = ocr::find_word_under_cursor(
-        &ocr_result.words,
-        x - region_left,
-        y - region_top,
-    )
-    .unwrap_or_default();
+    let grayscale = image::imageops::grayscale(&region);
+    let enhanced = image::imageops::contrast(&grayscale, 15.0);
+    let scaled_width = region_width * 3 / 2;
+    let scaled_height = region_height * 3 / 2;
+    let scaled = image::imageops::resize(
+        &enhanced,
+        scaled_width,
+        scaled_height,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let ocr_image = image::DynamicImage::ImageLuma8(scaled).to_rgba8();
+    let ocr_result = ocr::recognize(&ocr_image)?;
+    let cursor_x = (x - region_left) * 3 / 2;
+    let cursor_y = (y - region_top) * 3 / 2;
+    let selected_index =
+        ocr::word_index_under_cursor(&ocr_result.words, cursor_x, cursor_y);
+    let selected_text = selected_index
+        .and_then(|_| ocr::find_word_under_cursor(&ocr_result.words, cursor_x, cursor_y))
+        .unwrap_or_default();
+    let context = selected_index
+        .and_then(|index| ocr::context_for_word(&ocr_result.words, index))
+        .unwrap_or_default();
+    let selected_confidence = selected_index
+        .map(|index| ocr_result.words[index].confidence)
+        .unwrap_or_default();
 
     Ok(json!({
         "x": x,
         "y": y,
         "ocrText": ocr_result.raw_text,
         "selectedText": selected_text,
+        "context": context,
+        "selectedConfidence": selected_confidence,
         "words": ocr_result.words,
     }))
 }
@@ -518,8 +540,21 @@ fn handle_translation_shortcut(app: tauri::AppHandle) {
         return;
     }
 
-    let translation = match translation::translate_text(
+    let context = result
+        .get("context")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let confidence = result
+        .get("selectedConfidence")
+        .and_then(|value| value.as_f64())
+        .unwrap_or_default();
+    eprintln!(
+        "[QuickTranslate] OCR selected '{text}' (confidence {confidence:.1}); context: '{context}'"
+    );
+
+    let translation = match translation::translate_text_with_context(
         text,
+        context,
         &settings.source_language,
         &settings.target_language,
     ) {
@@ -534,7 +569,7 @@ fn handle_translation_shortcut(app: tauri::AppHandle) {
     };
 
     let app_for_overlay = app.clone();
-    let text_for_overlay = translation.translated;
+    let text_for_overlay = format!("{} → {}", translation.original, translation.translated);
     let _ = app.run_on_main_thread(move || {
         let _ = show_translation_overlay(app_for_overlay, text_for_overlay);
     });
@@ -608,6 +643,7 @@ fn find_ollama_binary() -> Option<std::path::PathBuf> {
 fn ensure_local_model() -> Result<(), String> {
     let ollama = find_ollama_binary().ok_or_else(|| {
         let _ = Command::new("powershell")
+            .creation_flags(CREATE_NO_WINDOW)
             .args([
                 "-NoProfile",
                 "-NonInteractive",
@@ -621,6 +657,7 @@ fn ensure_local_model() -> Result<(), String> {
     })?;
 
     let list = Command::new(&ollama)
+        .creation_flags(CREATE_NO_WINDOW)
         .arg("list")
         .output()
         .map_err(|err| format!("Failed to query installed models: {err}"))?;
@@ -632,6 +669,7 @@ fn ensure_local_model() -> Result<(), String> {
     }
 
     let pull = Command::new(&ollama)
+        .creation_flags(CREATE_NO_WINDOW)
         .args(["pull", desired_model])
         .status()
         .map_err(|err| format!("Failed to download model: {err}"))?;
