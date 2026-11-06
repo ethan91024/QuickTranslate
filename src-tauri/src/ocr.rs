@@ -1,6 +1,6 @@
 use std::io::Write;
 use std::os::windows::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use image::ImageEncoder;
@@ -135,79 +135,6 @@ pub fn recognize(image: &image::RgbaImage) -> Result<OcrResult, String> {
     Ok(OcrResult { raw_text, words })
 }
 
-pub fn recognize_from_file(image_path: &Path) -> Result<OcrResult, String> {
-    let tesseract_path = resolve_tesseract_path()?;
-
-    if !Command::new(&tesseract_path)
-        .creation_flags(CREATE_NO_WINDOW)
-        .arg("--version")
-        .output()
-        .map_err(|err| format!("Failed to check Tesseract: {err}"))?
-        .status
-        .success()
-    {
-        return Err("Tesseract OCR is not available.".to_string());
-    }
-
-    let output = Command::new(&tesseract_path)
-        .creation_flags(CREATE_NO_WINDOW)
-        .arg(image_path)
-        .arg("stdout")
-        .arg("--psm")
-        .arg("11")
-        .arg("tsv")
-        .output()
-        .map_err(|err| format!("Failed to run Tesseract: {err}"))?;
-
-    if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Tesseract failed: {error}"));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut words: Vec<OcrWord> = Vec::new();
-    let mut lines = stdout.lines();
-    let _header = lines.next();
-
-    for row in lines {
-        let fields: Vec<&str> = row.split('\t').collect();
-        if fields.len() < 12 {
-            continue;
-        }
-
-        let text = fields[11].trim();
-        if text.is_empty() {
-            continue;
-        }
-
-        let left = fields[6].parse::<i32>().unwrap_or_default();
-        let top = fields[7].parse::<i32>().unwrap_or_default();
-        let width = fields[8].parse::<i32>().unwrap_or_default();
-        let height = fields[9].parse::<i32>().unwrap_or_default();
-        let confidence = fields[10].parse::<f32>().unwrap_or(-1.0);
-        if confidence < 0.0 {
-            continue;
-        }
-
-        words.push(OcrWord {
-            text: text.to_string(),
-            left,
-            top,
-            width,
-            height,
-            confidence,
-        });
-    }
-
-    let raw_text = words
-        .iter()
-        .map(|word| word.text.as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    Ok(OcrResult { raw_text, words })
-}
-
 const MIN_WORD_CONFIDENCE: f32 = 25.0;
 
 pub fn word_index_under_cursor(words: &[OcrWord], cursor_x: i32, cursor_y: i32) -> Option<usize> {
@@ -262,6 +189,13 @@ pub fn context_for_word(words: &[OcrWord], selected_index: usize) -> Option<Stri
 }
 
 fn word_at_horizontal_position(text: &str, left: i32, width: i32, cursor_x: i32) -> Option<String> {
+    let token = text.trim_start_matches(|character| {
+        matches!(character, '\'' | '"' | '`' | '(' | '[')
+    });
+    if token.starts_with("--") {
+        return None;
+    }
+
     let characters: Vec<char> = text.chars().collect();
     let mut ranges = Vec::new();
     let mut index = 0;
@@ -353,6 +287,20 @@ mod tests {
         }];
 
         assert_eq!(find_word_under_cursor(&words, 15, 12), None);
+    }
+
+    #[test]
+    fn ignores_words_inside_command_line_options() {
+        let words = [OcrWord {
+            text: "'--future-incompat-report',".to_string(),
+            left: 0,
+            top: 0,
+            width: 220,
+            height: 24,
+            confidence: 90.0,
+        }];
+
+        assert_eq!(find_word_under_cursor(&words, 80, 12), None);
     }
 
     #[test]

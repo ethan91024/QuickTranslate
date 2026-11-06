@@ -19,21 +19,6 @@ pub struct Settings {
     pub interface_language: String,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::Settings;
-
-    #[test]
-    fn old_settings_without_interface_language_default_to_traditional_chinese() {
-        let settings: Settings = serde_json::from_str(
-            r#"{"api_key":"","base_url":"","model":"","shortcut":"","target_language":"","source_language":""}"#,
-        )
-        .unwrap();
-
-        assert_eq!(settings.interface_language, "zh-Hant");
-    }
-}
-
 impl Settings {
     fn default_path() -> Result<PathBuf, String> {
         let app_data_dir = std::env::var("APPDATA")
@@ -120,5 +105,20 @@ impl Settings {
         fs::write(path, json)
             .map_err(|err| format!("Failed to save settings: {err}"))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Settings;
+
+    #[test]
+    fn old_settings_without_interface_language_default_to_traditional_chinese() {
+        let settings: Settings = serde_json::from_str(
+            r#"{"api_key":"","base_url":"","model":"","shortcut":"","target_language":"","source_language":""}"#,
+        )
+        .unwrap();
+
+        assert_eq!(settings.interface_language, "zh-Hant");
     }
 }
