@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import packageJson from "../package.json";
 
 type Settings = {
   api_key: string;
@@ -146,7 +147,7 @@ function App() {
   const [status, setStatus] = useState<StatusMessage | null>(null);
   const [isListeningShortcut, setIsListeningShortcut] = useState(false);
   const saveQueue = useRef<Promise<void>>(Promise.resolve());
-  const appVersion = "0.1.4";
+  const appVersion = packageJson.version;
   const locale = strings[settings.interface_language] ?? strings["zh-Hant"];
 
   useEffect(() => {

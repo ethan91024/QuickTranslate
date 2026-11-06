@@ -4,6 +4,7 @@ mod screen;
 mod translation;
 
 use std::process::Command;
+use std::os::windows::process::CommandExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -17,7 +18,8 @@ use tauri::{
 use tauri::webview::Color;
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
-const APP_VERSION: &str = "0.1.4";
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 const HOTKEY_COOLDOWN_MS: u64 = 1500;
 
 static HOTKEY_DEBOUNCE: AtomicBool = AtomicBool::new(false);
@@ -180,14 +182,24 @@ fn update_native_language(app: &tauri::AppHandle, language: &str) {
     }
 }
 
-fn show_overlay_status(app: &tauri::AppHandle, language: &str, status: OverlayStatus) {
+fn show_overlay_status(
+    app: &tauri::AppHandle,
+    language: &str,
+    status: OverlayStatus,
+) -> Result<(), String> {
     let app = app.clone();
-    let app_for_overlay = app.clone();
     let text = overlay_status_text(language, status).to_string();
     let is_loading = matches!(status, OverlayStatus::Translating);
-    let _ = app.run_on_main_thread(move || {
-        let _ = show_overlay_content(app_for_overlay, text, is_loading);
-    });
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let app_for_overlay = app.clone();
+    app.run_on_main_thread(move || {
+        let _ = sender.send(show_overlay_content(app_for_overlay, text, is_loading));
+    })
+    .map_err(|err| format!("Failed to schedule overlay update: {err}"))?;
+
+    receiver
+        .recv_timeout(Duration::from_secs(2))
+        .map_err(|err| format!("Timed out waiting for overlay update: {err}"))?
 }
 
 fn register_translation_shortcut(
@@ -212,7 +224,8 @@ fn register_translation_shortcut(
 
     let registration = app.global_shortcut().on_shortcut(shortcut, |_app, _shortcut, event| {
         if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
-            handle_translation_shortcut(_app.clone());
+            let app = _app.clone();
+            std::thread::spawn(move || handle_translation_shortcut(app));
         }
     });
 
@@ -233,8 +246,16 @@ fn ping() -> String {
 
 #[tauri::command]
 fn quick_capture() -> Result<serde_json::Value, String> {
+    quick_capture_with_callback(|| Ok(()))
+}
+
+fn quick_capture_with_callback(
+    on_screen_captured: impl FnOnce() -> Result<(), String>,
+) -> Result<serde_json::Value, String> {
     let (x, y) = screen::get_cursor_position()?;
     let image = screen::capture_primary_screen()?;
+    on_screen_captured()?;
+
     let region_width = image.width().min(1200);
     let region_height = image.height().min(360);
     let region_left = (x - region_width as i32 / 2).clamp(0, image.width() as i32 - region_width as i32);
@@ -247,21 +268,64 @@ fn quick_capture() -> Result<serde_json::Value, String> {
         region_height,
     )
     .to_image();
-    let ocr_result = ocr::recognize(&region)?;
-    let selected_text = ocr::find_word_under_cursor(
-        &ocr_result.words,
-        x - region_left,
-        y - region_top,
-    )
-    .unwrap_or_default();
+    let grayscale = image::imageops::grayscale(&region);
+    let enhanced = image::imageops::contrast(&grayscale, 15.0);
+    let scaled_width = region_width * 3 / 2;
+    let scaled_height = region_height * 3 / 2;
+    let scaled = image::imageops::resize(
+        &enhanced,
+        scaled_width,
+        scaled_height,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let ocr_image = image::DynamicImage::ImageLuma8(scaled).to_rgba8();
+    let ocr_result = ocr::recognize(&ocr_image)?;
+    let cursor_x = (x - region_left) * 3 / 2;
+    let cursor_y = (y - region_top) * 3 / 2;
+    let selected_index =
+        ocr::word_index_under_cursor(&ocr_result.words, cursor_x, cursor_y);
+    let context = selected_index
+        .and_then(|index| ocr::context_for_word(&ocr_result.words, index))
+        .unwrap_or_default();
+    let selected_text = if translation::is_diagnostic_context(&context) {
+        String::new()
+    } else {
+        selected_index
+            .and_then(|_| ocr::find_word_under_cursor(&ocr_result.words, cursor_x, cursor_y))
+            .unwrap_or_default()
+    };
+    let selected_confidence = selected_index
+        .map(|index| ocr_result.words[index].confidence)
+        .unwrap_or_default();
 
     Ok(json!({
         "x": x,
         "y": y,
         "ocrText": ocr_result.raw_text,
         "selectedText": selected_text,
+        "context": context,
+        "selectedConfidence": selected_confidence,
         "words": ocr_result.words,
     }))
+}
+
+fn hide_overlay_before_capture(app: &tauri::AppHandle) -> Result<(), String> {
+    let Some(overlay) = app.get_webview_window("translation-overlay") else {
+        return Ok(());
+    };
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    app.run_on_main_thread(move || {
+        let _ = sender.send(
+            overlay
+                .hide()
+                .map_err(|err| format!("Failed to hide translation overlay before capture: {err}")),
+        );
+    })
+    .map_err(|err| format!("Failed to schedule overlay hide before capture: {err}"))?;
+
+    receiver
+        .recv_timeout(Duration::from_secs(2))
+        .map_err(|err| format!("Timed out hiding translation overlay before capture: {err}"))?
 }
 
 #[tauri::command]
@@ -284,7 +348,7 @@ fn ensure_overlay_window(app: &tauri::AppHandle) -> Result<(), String> {
     .skip_taskbar(true)
     .shadow(false)
     .focusable(false)
-    .inner_size(420.0, 180.0)
+    .inner_size(420.0, 380.0)
     .visible(false)
     .build()
     .map_err(|err| format!("Failed to create overlay window: {err}"))?;
@@ -306,18 +370,18 @@ fn overlay_window_size(text: &str, is_loading: bool) -> (f64, f64) {
         .lines()
         .map(|line| {
             line.chars()
-                .map(|character| if character.is_ascii() { 7.0 } else { 12.0 })
+                .map(|character| if character.is_ascii() { 7.0 } else { 13.0 })
                 .sum::<f64>()
         })
         .collect();
     let line_count: usize = line_widths
         .iter()
-        .map(|width| (width / 190.0).ceil().max(1.0) as usize)
+        .map(|width| (width / 380.0).ceil().max(1.0) as usize)
         .sum::<usize>()
         .max(1);
-    let width = (line_widths.into_iter().fold(0.0_f64, f64::max).min(190.0) + 28.0)
-        .clamp(120.0, 220.0);
-    let height = (line_count as f64 * 15.0 + 10.0).clamp(32.0, 240.0);
+    let width =
+        (line_widths.into_iter().fold(0.0_f64, f64::max).min(380.0) + 24.0).clamp(160.0, 420.0);
+    let height = (line_count as f64 * 18.0 + 20.0).clamp(40.0, 380.0);
 
     (width, height)
 }
@@ -350,6 +414,7 @@ fn show_overlay_content(
             const overlay = document.getElementById('overlay');
             const textEl = document.getElementById('overlay-text');
             if (!overlay || !textEl) return;
+            overlay.classList.toggle('loading', Boolean(payload.loading));
             if (payload.loading) {{
                 const dots = document.createElement('span');
                 dots.className = 'loading-dots';
@@ -393,14 +458,25 @@ mod overlay_tests {
     use super::overlay_window_size;
 
     #[test]
-    fn translated_text_window_grows_for_wrapped_lines() {
-        let (_, one_line_height) = overlay_window_size("agent", false);
-        let (_, multiple_lines_height) = overlay_window_size(
-            "這是一段很長的翻譯文字，需要換行顯示，不應該被固定高度裁掉",
+    fn dictionary_entry_window_grows_for_multiline_content() {
+        let (_, one_line_height) = overlay_window_size("1.變動(v.)", false);
+        let (entry_width, entry_height) = overlay_window_size(
+            "tabloids /ˈtæb.lɔɪdz/\n名詞（複數）\n1. 八卦小報、通俗小報\n2. 聳動八卦新聞、娛樂小報\n例句：\n- The tabloids love celebrity gossip.\n- 八卦小報很喜歡報導名人八卦。\n原形： tabloid\n語氣： 通常帶有些微貶義。",
             false,
         );
 
-        assert!(multiple_lines_height > one_line_height);
+        assert!(entry_width > 220.0);
+        assert!(entry_height > one_line_height);
+    }
+
+    #[test]
+    fn long_dictionary_entries_are_capped_to_a_scrollable_window_size() {
+        let long_entry = "long line ".repeat(500);
+        let (width, height) = overlay_window_size(&long_entry, false);
+
+        assert!(width <= 420.0);
+        assert!(width > 220.0);
+        assert_eq!(height, 380.0);
     }
 
     #[test]
@@ -431,11 +507,12 @@ fn start_overlay_tracking(app: tauri::AppHandle) {
             let configured_mouse_trigger = MOUSE_SIDE_TRIGGER.load(Ordering::SeqCst);
             for button in 1..=5 {
                 let button_is_down = screen::is_mouse_button_down(button);
-                if button_is_down && !mouse_buttons_were_down[(button - 1) as usize] {
-                    if button == configured_mouse_trigger {
-                        let app_for_trigger = app.clone();
-                        std::thread::spawn(move || handle_translation_shortcut(app_for_trigger));
-                    }
+                if button_is_down
+                    && !mouse_buttons_were_down[(button - 1) as usize]
+                    && button == configured_mouse_trigger
+                {
+                    let app_for_trigger = app.clone();
+                    std::thread::spawn(move || handle_translation_shortcut(app_for_trigger));
                 }
                 mouse_buttons_were_down[(button - 1) as usize] = button_is_down;
             }
@@ -491,14 +568,36 @@ fn handle_translation_shortcut(app: tauri::AppHandle) {
     let settings = config::Settings::load().unwrap_or_else(|_| config::Settings::default());
     let interface_language = settings.interface_language.clone();
 
-    show_overlay_status(&app, &interface_language, OverlayStatus::Translating);
+    if let Err(err) = show_overlay_status(&app, &interface_language, OverlayStatus::Translating) {
+        eprintln!("[QuickTranslate] failed to show loading overlay: {err}");
+    }
+
+    std::thread::sleep(Duration::from_millis(40));
 
     let _capture_lock = SCREEN_CAPTURE_LOCK.lock();
 
-    let result = quick_capture();
+    if let Err(err) = hide_overlay_before_capture(&app) {
+        eprintln!("[QuickTranslate] {err}");
+        if let Err(overlay_err) =
+            show_overlay_status(&app, &interface_language, OverlayStatus::CaptureFailed)
+        {
+            eprintln!("[QuickTranslate] failed to show capture error: {overlay_err}");
+        }
+        CAPTURE_IN_PROGRESS.store(false, Ordering::SeqCst);
+        HOTKEY_DEBOUNCE.store(false, Ordering::SeqCst);
+        return;
+    }
+
+    let result = quick_capture_with_callback(|| {
+        show_overlay_status(&app, &interface_language, OverlayStatus::Translating)
+    });
     if let Err(err) = result {
         eprintln!("[QuickTranslate] capture failed: {err}");
-        show_overlay_status(&app, &interface_language, OverlayStatus::CaptureFailed);
+        if let Err(overlay_err) =
+            show_overlay_status(&app, &interface_language, OverlayStatus::CaptureFailed)
+        {
+            eprintln!("[QuickTranslate] failed to show capture error: {overlay_err}");
+        }
         CAPTURE_IN_PROGRESS.store(false, Ordering::SeqCst);
         HOTKEY_DEBOUNCE.store(false, Ordering::SeqCst);
         return;
@@ -512,21 +611,40 @@ fn handle_translation_shortcut(app: tauri::AppHandle) {
     };
 
     if text.trim().is_empty() {
-        show_overlay_status(&app, &interface_language, OverlayStatus::NoText);
+        if let Err(err) = show_overlay_status(&app, &interface_language, OverlayStatus::NoText) {
+            eprintln!("[QuickTranslate] failed to show empty OCR result: {err}");
+        }
         CAPTURE_IN_PROGRESS.store(false, Ordering::SeqCst);
         HOTKEY_DEBOUNCE.store(false, Ordering::SeqCst);
         return;
     }
 
-    let translation = match translation::translate_text(
+    let context = result
+        .get("context")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let confidence = result
+        .get("selectedConfidence")
+        .and_then(|value| value.as_f64())
+        .unwrap_or_default();
+    eprintln!(
+        "[QuickTranslate] OCR selected '{text}' (confidence {confidence:.1}); context: '{context}'"
+    );
+
+    let translation = match translation::translate_text_with_context(
         text,
+        context,
         &settings.source_language,
         &settings.target_language,
     ) {
         Ok(value) => value,
         Err(err) => {
             eprintln!("[QuickTranslate] translation failed: {err}");
-            show_overlay_status(&app, &interface_language, OverlayStatus::TranslationFailed);
+            if let Err(overlay_err) =
+                show_overlay_status(&app, &interface_language, OverlayStatus::TranslationFailed)
+            {
+                eprintln!("[QuickTranslate] failed to show translation error: {overlay_err}");
+            }
             CAPTURE_IN_PROGRESS.store(false, Ordering::SeqCst);
             HOTKEY_DEBOUNCE.store(false, Ordering::SeqCst);
             return;
@@ -608,6 +726,7 @@ fn find_ollama_binary() -> Option<std::path::PathBuf> {
 fn ensure_local_model() -> Result<(), String> {
     let ollama = find_ollama_binary().ok_or_else(|| {
         let _ = Command::new("powershell")
+            .creation_flags(CREATE_NO_WINDOW)
             .args([
                 "-NoProfile",
                 "-NonInteractive",
@@ -621,6 +740,7 @@ fn ensure_local_model() -> Result<(), String> {
     })?;
 
     let list = Command::new(&ollama)
+        .creation_flags(CREATE_NO_WINDOW)
         .arg("list")
         .output()
         .map_err(|err| format!("Failed to query installed models: {err}"))?;
@@ -632,6 +752,7 @@ fn ensure_local_model() -> Result<(), String> {
     }
 
     let pull = Command::new(&ollama)
+        .creation_flags(CREATE_NO_WINDOW)
         .args(["pull", desired_model])
         .status()
         .map_err(|err| format!("Failed to download model: {err}"))?;

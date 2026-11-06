@@ -124,7 +124,7 @@ pub fn capture_primary_screen() -> Result<image::RgbaImage, String> {
             return Err("Failed to read bitmap bits from desktop capture.".to_string());
         }
 
-        for pixel in pixels.chunks_exact_mut(4) {
+        for pixel in pixels.as_chunks_mut::<4>().0 {
             pixel.swap(0, 2);
         }
 

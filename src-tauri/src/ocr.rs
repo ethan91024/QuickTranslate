@@ -1,9 +1,12 @@
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::os::windows::process::CommandExt;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use image::ImageEncoder;
 use serde::{Deserialize, Serialize};
+
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 fn resolve_tesseract_path() -> Result<PathBuf, String> {
     let candidates = [
@@ -36,6 +39,7 @@ pub struct OcrWord {
     pub top: i32,
     pub width: i32,
     pub height: i32,
+    pub confidence: f32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -48,6 +52,7 @@ pub fn recognize(image: &image::RgbaImage) -> Result<OcrResult, String> {
     let tesseract_path = resolve_tesseract_path()?;
 
     let mut child = Command::new(&tesseract_path)
+        .creation_flags(CREATE_NO_WINDOW)
         .arg("stdin")
         .arg("stdout")
         .arg("--psm")
@@ -106,6 +111,10 @@ pub fn recognize(image: &image::RgbaImage) -> Result<OcrResult, String> {
         let top = fields[7].parse::<i32>().unwrap_or_default();
         let width = fields[8].parse::<i32>().unwrap_or_default();
         let height = fields[9].parse::<i32>().unwrap_or_default();
+        let confidence = fields[10].parse::<f32>().unwrap_or(-1.0);
+        if confidence < 0.0 {
+            continue;
+        }
 
         words.push(OcrWord {
             text: text.to_string(),
@@ -113,6 +122,7 @@ pub fn recognize(image: &image::RgbaImage) -> Result<OcrResult, String> {
             top,
             width,
             height,
+            confidence,
         });
     }
 
@@ -125,106 +135,67 @@ pub fn recognize(image: &image::RgbaImage) -> Result<OcrResult, String> {
     Ok(OcrResult { raw_text, words })
 }
 
-pub fn recognize_from_file(image_path: &Path) -> Result<OcrResult, String> {
-    let tesseract_path = resolve_tesseract_path()?;
+const MIN_WORD_CONFIDENCE: f32 = 25.0;
 
-    if !Command::new(&tesseract_path)
-        .arg("--version")
-        .output()
-        .map_err(|err| format!("Failed to check Tesseract: {err}"))?
-        .status
-        .success()
-    {
-        return Err("Tesseract OCR is not available.".to_string());
-    }
-
-    let output = Command::new(&tesseract_path)
-        .arg(image_path)
-        .arg("stdout")
-        .arg("--psm")
-        .arg("11")
-        .arg("tsv")
-        .output()
-        .map_err(|err| format!("Failed to run Tesseract: {err}"))?;
-
-    if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Tesseract failed: {error}"));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut words: Vec<OcrWord> = Vec::new();
-    let mut lines = stdout.lines();
-    let _header = lines.next();
-
-    for row in lines {
-        let fields: Vec<&str> = row.split('\t').collect();
-        if fields.len() < 12 {
-            continue;
-        }
-
-        let text = fields[11].trim();
-        if text.is_empty() {
-            continue;
-        }
-
-        let left = fields[6].parse::<i32>().unwrap_or_default();
-        let top = fields[7].parse::<i32>().unwrap_or_default();
-        let width = fields[8].parse::<i32>().unwrap_or_default();
-        let height = fields[9].parse::<i32>().unwrap_or_default();
-
-        words.push(OcrWord {
-            text: text.to_string(),
-            left,
-            top,
-            width,
-            height,
-        });
-    }
-
-    let raw_text = words
+pub fn word_index_under_cursor(words: &[OcrWord], cursor_x: i32, cursor_y: i32) -> Option<usize> {
+    words
         .iter()
-        .map(|word| word.text.as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    Ok(OcrResult { raw_text, words })
+        .enumerate()
+        .filter(|(_, word)| word.confidence >= MIN_WORD_CONFIDENCE)
+        .filter(|(_, word)| {
+            let left = word.left;
+            let top = word.top;
+            let right = word.left + word.width;
+            let bottom = word.top + word.height;
+            cursor_x >= left && cursor_x <= right && cursor_y >= top && cursor_y <= bottom
+        })
+        .max_by(|(_, first), (_, second)| first.confidence.total_cmp(&second.confidence))
+        .map(|(index, _)| index)
 }
 
 pub fn find_word_under_cursor(words: &[OcrWord], cursor_x: i32, cursor_y: i32) -> Option<String> {
-    let mut best_match: Option<String> = None;
-    let mut best_distance = i32::MAX;
+    let word = words.get(word_index_under_cursor(words, cursor_x, cursor_y)?)?;
+    word_at_horizontal_position(&word.text, word.left, word.width, cursor_x)
+}
 
-    for word in words {
-        let left = word.left;
-        let top = word.top;
-        let right = word.left + word.width;
-        let bottom = word.top + word.height;
+pub fn context_for_word(words: &[OcrWord], selected_index: usize) -> Option<String> {
+    let selected = words.get(selected_index)?;
+    let selected_center_y = selected.top + selected.height / 2;
+    let line_tolerance = (selected.height.max(1) as f32 * 0.75).max(8.0) as i32;
 
-        let contains_cursor = cursor_x >= left && cursor_x <= right && cursor_y >= top && cursor_y <= bottom;
-        if contains_cursor {
-            if let Some(selected) = word_at_horizontal_position(&word.text, left, word.width, cursor_x) {
-                return Some(selected);
-            }
-            continue;
-        }
+    let mut line_words: Vec<(usize, &OcrWord)> = words
+        .iter()
+        .enumerate()
+        .filter(|(_, word)| {
+            word.confidence >= MIN_WORD_CONFIDENCE
+                && ((word.top + word.height / 2) - selected_center_y).abs() <= line_tolerance
+        })
+        .collect();
+    line_words.sort_by_key(|(_, word)| word.left);
 
-        let center_x = word.left + word.width / 2;
-        let center_y = word.top + word.height / 2;
-        let distance = (cursor_x - center_x).abs() + (cursor_y - center_y).abs();
+    let selected_position = line_words
+        .iter()
+        .position(|(index, _)| *index == selected_index)?;
+    let start = selected_position.saturating_sub(3);
+    let end = (selected_position + 4).min(line_words.len());
 
-        if distance < best_distance {
-            if let Some(selected) = word_at_horizontal_position(&word.text, left, word.width, cursor_x) {
-                best_distance = distance;
-                best_match = Some(selected);
-            }
-        }
-    }
-
-    best_match
+    Some(
+        line_words[start..end]
+            .iter()
+            .map(|(_, word)| word.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }
 
 fn word_at_horizontal_position(text: &str, left: i32, width: i32, cursor_x: i32) -> Option<String> {
+    let token = text.trim_start_matches(|character| {
+        matches!(character, '\'' | '"' | '`' | '(' | '[')
+    });
+    if token.starts_with("--") {
+        return None;
+    }
+
     let characters: Vec<char> = text.chars().collect();
     let mut ranges = Vec::new();
     let mut index = 0;
@@ -284,6 +255,7 @@ mod tests {
             top: 0,
             width: 180,
             height: 24,
+            confidence: 90.0,
         }];
 
         assert_eq!(find_word_under_cursor(&words, 80, 12).as_deref(), Some("agent"));
@@ -297,6 +269,7 @@ mod tests {
             top: 0,
             width: 70,
             height: 24,
+            confidence: 90.0,
         }];
 
         assert_eq!(find_word_under_cursor(&words, 35, 12).as_deref(), Some("agent"));
@@ -310,8 +283,72 @@ mod tests {
             top: 0,
             width: 30,
             height: 24,
+            confidence: 90.0,
         }];
 
         assert_eq!(find_word_under_cursor(&words, 15, 12), None);
+    }
+
+    #[test]
+    fn ignores_words_inside_command_line_options() {
+        let words = [OcrWord {
+            text: "'--future-incompat-report',".to_string(),
+            left: 0,
+            top: 0,
+            width: 220,
+            height: 24,
+            confidence: 90.0,
+        }];
+
+        assert_eq!(find_word_under_cursor(&words, 80, 12), None);
+    }
+
+    #[test]
+    fn does_not_select_a_nearby_word_when_cursor_is_outside_its_bounds() {
+        let words = [OcrWord {
+            text: "TERMINAL".to_string(),
+            left: 100,
+            top: 100,
+            width: 100,
+            height: 24,
+            confidence: 90.0,
+        }];
+
+        assert_eq!(find_word_under_cursor(&words, 99, 112), None);
+    }
+
+    #[test]
+    fn ignores_low_confidence_words() {
+        let words = [OcrWord {
+            text: "TERMINAL".to_string(),
+            left: 100,
+            top: 100,
+            width: 100,
+            height: 24,
+            confidence: 20.0,
+        }];
+
+        assert_eq!(find_word_under_cursor(&words, 120, 112), None);
+    }
+
+    #[test]
+    fn builds_context_from_nearby_words_on_the_same_line() {
+        let words = ["Open", "the", "terminal", "now"]
+            .iter()
+            .enumerate()
+            .map(|(index, text)| OcrWord {
+                text: (*text).to_string(),
+                left: index as i32 * 50,
+                top: 10,
+                width: 40,
+                height: 20,
+                confidence: 90.0,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            context_for_word(&words, 2).as_deref(),
+            Some("Open the terminal now")
+        );
     }
 }
