@@ -22,6 +22,7 @@ Rust 處理螢幕擷取、系統快捷鍵和桌面視窗等原生功能
 
 <img width="639" height="751" alt="image" src="https://github.com/user-attachments/assets/3f4f5b21-29a4-40b9-ab06-3031e5274e95" />
 
-<img width="414" height="111" alt="image" src="https://github.com/user-attachments/assets/d85fa690-c8e4-44f6-a15a-946c1c5e4365" />
+<img width="546" height="403" alt="image" src="https://github.com/user-attachments/assets/803185f7-1897-4a79-95b7-78bdb060f0d6" />
+
 
 
